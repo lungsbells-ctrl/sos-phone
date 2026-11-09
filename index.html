@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ส่งพิกัดมือถือให้ SOS Beacon</title>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--text:#e5e7eb;--muted:#94a3b8;--ok:#22c55e;--bad:#ef4444;--warn:#f59e0b;--btn:#2563eb}
+  @media (prefers-color-scheme: light){:root{--bg:#f1f5f9;--card:#fff;--text:#0f172a;--muted:#475569}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Sarabun,sans-serif;line-height:1.5}
+  main{max-width:520px;margin:0 auto;padding:16px}
+  h1{font-size:20px;margin:6px 0 2px}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 14px}
+  .card{background:var(--card);border-radius:14px;padding:14px;margin-bottom:12px}
+  .row{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px solid #64748b33;font-size:14px}
+  .row:last-child{border-bottom:0}
+  .row b{text-align:right;word-break:break-all}
+  button{width:100%;padding:14px;border:0;border-radius:12px;font-size:16px;font-weight:700;color:#fff;background:var(--btn);margin-top:8px}
+  button:disabled{opacity:.45}
+  button.alt{background:#475569}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  #log{font:12px Consolas,monospace;color:var(--muted);max-height:150px;overflow:auto;white-space:pre-wrap}
+  .note{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+  <h1>📡 ส่งพิกัดมือถือให้ SOS Beacon</h1>
+  <p class="sub">ใช้ GPS ของมือถือแทนโมดูล GPS ส่งไปที่บอร์ดผ่าน Bluetooth (BLE)</p>
+
+  <div id="unsupported" class="card warn" style="display:none">
+    เบราว์เซอร์นี้ไม่รองรับ Web Bluetooth ให้เปิดหน้านี้ด้วย <b>Chrome บน Android</b>
+    (iPhone/Safari ใช้ไม่ได้ ถ้าใช้ iPhone ให้ลองแอปเบราว์เซอร์ Bluefy)
+  </div>
+
+  <div class="card">
+    <div class="row"><span>Bluetooth</span><b id="bleState" class="bad">ยังไม่เชื่อมต่อ</b></div>
+    <div class="row"><span>GPS มือถือ</span><b id="gpsState" class="warn">ยังไม่เริ่ม</b></div>
+    <div class="row"><span>ตำแหน่ง</span><b id="pos">-</b></div>
+    <div class="row"><span>ความแม่นยำ</span><b id="acc">-</b></div>
+    <div class="row"><span>ส่งไปบอร์ดแล้ว</span><b id="sent">0 ครั้ง</b></div>
+    <button id="locBtn" class="alt">📍 ขออนุญาตใช้ตำแหน่ง (GPS มือถือ)</button>
+    <button id="connectBtn">🔗 เชื่อมต่อกับ SOS-Beacon</button>
+    <button id="homeBtn" class="alt" disabled>🏠 ตั้งตำแหน่งนี้เป็น Home</button>
+    <button id="disconnectBtn" class="alt" disabled>ตัดการเชื่อมต่อ</button>
+  </div>
+
+  <div class="card">
+    <div class="note">บันทึกการทำงาน</div>
+    <div id="log"></div>
+  </div>
+
+  <p class="note">
+    วิธีใช้: ① เปิดบอร์ดตัวส่ง (ตั้ง HAS_GPS_MODULE เป็น 0 ถ้าถอด GPS) ② กด "เชื่อมต่อ" แล้วเลือก SOS-Beacon
+    ③ อนุญาตการเข้าถึงตำแหน่ง ④ เปิดหน้านี้ค้างไว้และเปิดหน้าจอไว้ หน้าเว็บจะส่งพิกัดให้บอร์ดทุก 2 วินาที
+    ⑤ ยืนที่จุดฐานแล้วกด "ตั้งตำแหน่งนี้เป็น Home"<br>
+    ถ้าหน้านี้ถูกซ่อนหรือหน้าจอดับ มือถือบางรุ่นจะหยุดส่งพิกัด
+  </p>
+</main>
+
+<script>
+const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const SEND_EVERY_MS = 2000;
+
+const $ = (id) => document.getElementById(id);
+const bleState = $('bleState'), gpsState = $('gpsState'), posEl = $('pos'), accEl = $('acc'), sentEl = $('sent');
+const locBtn = $('locBtn'), connectBtn = $('connectBtn'), homeBtn = $('homeBtn'), disconnectBtn = $('disconnectBtn'), logEl = $('log');
+
+let device = null, rxChar = null, watchId = null, sendTimer = null, wakeLock = null;
+let lastPos = null, sentCount = 0;
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString('th-TH');
+  logEl.textContent = `${t}  ${msg}\n` + logEl.textContent.slice(0, 3000);
+}
+
+function setBle(text, cls) { bleState.textContent = text; bleState.className = cls; }
+function setGps(text, cls) { gpsState.textContent = text; gpsState.className = cls; }
+
+if (!navigator.bluetooth) $('unsupported').style.display = 'block';
+
+async function write(text) {
+  if (!rxChar) throw new Error('ยังไม่ได้เชื่อมต่อ');
+  const data = new TextEncoder().encode(text);
+  if (rxChar.writeValueWithoutResponse) await rxChar.writeValueWithoutResponse(data);
+  else await rxChar.writeValue(data);
+}
+
+function startGps() {
+  if (watchId !== null) return;   // เริ่มไปแล้ว
+  if (!navigator.geolocation) { setGps('ไม่รองรับ', 'bad'); return; }
+  setGps('กำลังหาตำแหน่ง... (ถ้ามีหน้าต่างถาม ให้กดอนุญาต)', 'warn');
+  watchId = navigator.geolocation.watchPosition(
+    (p) => {
+      lastPos = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, t: Date.now() };
+      setGps('ได้ตำแหน่งแล้ว', 'ok');
+      posEl.textContent = `${lastPos.lat.toFixed(5)}, ${lastPos.lon.toFixed(5)}`;
+      accEl.textContent = `±${Math.round(lastPos.acc)} ม.`;
+    },
+    (e) => {
+      const m = { 1: 'ไม่ได้อนุญาตตำแหน่ง', 2: 'หาตำแหน่งไม่ได้', 3: 'หมดเวลา' }[e.code] || e.message;
+      setGps(m, 'bad');
+      log('GPS มือถือ: ' + m);
+      if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+      if (e.code === 1) {
+        log('วิธีแก้: ① เปิด Location ของมือถือ ② ตั้งค่า > แอป > Chrome > สิทธิ์ > ตำแหน่ง = อนุญาต ③ ใน Chrome แตะไอคอนข้างแถบที่อยู่ > สิทธิ์ > ตำแหน่ง = อนุญาต แล้วกดปุ่ม "ขออนุญาตใช้ตำแหน่ง" อีกครั้ง');
+        if (location.protocol === 'file:') log('หมายเหตุ: เปิดจากไฟล์ในเครื่อง (file://) Chrome บางรุ่นไม่ถามขอตำแหน่ง ถ้ายังไม่ได้ให้โฮสต์ที่ลิงก์ https');
+      }
+    },
+    { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 }
+  );
+}
+
+async function sendPosition() {
+  if (!rxChar || !lastPos) return;
+  if (Date.now() - lastPos.t > 20000) { setGps('ตำแหน่งเก่าเกินไป', 'warn'); return; }
+  // ใช้ทศนิยม 5 ตำแหน่ง (~1 เมตร) ให้ข้อความสั้นพอดีกับแพ็กเก็ต BLE
+  const msg = `P,${lastPos.lat.toFixed(5)},${lastPos.lon.toFixed(5)}`;
+  try {
+    await write(msg);
+    sentCount++;
+    sentEl.textContent = `${sentCount} ครั้ง`;
+  } catch (e) {
+    log('ส่งไม่สำเร็จ: ' + e.message);
+  }
+}
+
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) { /* ข้ามได้ */ }
+}
+
+function cleanup() {
+  clearInterval(sendTimer); sendTimer = null;
+  if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  rxChar = null;
+  homeBtn.disabled = true; disconnectBtn.disabled = true; connectBtn.disabled = false;
+  setBle('ยังไม่เชื่อมต่อ', 'bad');
+  setGps('หยุดแล้ว', 'warn');
+  try { if (wakeLock) wakeLock.release(); } catch (e) {}
+}
+
+// แสดงสถานะสิทธิ์ตำแหน่งปัจจุบัน (ถ้าเบราว์เซอร์รองรับ)
+if (navigator.permissions && navigator.permissions.query) {
+  navigator.permissions.query({ name: 'geolocation' }).then((st) => {
+    const show = () => {
+      if (watchId !== null) return;
+      const m = { granted: ['อนุญาตแล้ว (กดปุ่มเพื่อเริ่ม)', 'ok'], prompt: ['ยังไม่ได้ขออนุญาต', 'warn'], denied: ['ถูกปิดกั้นไว้ (ดูวิธีแก้ในบันทึก)', 'bad'] }[st.state];
+      if (m) setGps(m[0], m[1]);
+    };
+    show();
+    st.onchange = show;
+  }).catch(() => {});
+}
+
+locBtn.addEventListener('click', () => {
+  if (watchId !== null) { log('GPS มือถือกำลังทำงานอยู่แล้ว'); return; }
+  startGps();
+});
+
+connectBtn.addEventListener('click', async () => {
+  // ขอตำแหน่ง "ก่อน" เป็นอย่างแรก ขณะที่ยังอยู่ในจังหวะที่ผู้ใช้เพิ่งกดปุ่ม
+  // เพราะถ้าขอหลังจากรอ Bluetooth เสร็จ เบราว์เซอร์อาจไม่แสดงหน้าต่างขออนุญาต
+  startGps();
+  try {
+    connectBtn.disabled = true;
+    setBle('กำลังค้นหา...', 'warn');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE] }, { namePrefix: 'SOS-Beacon' }],
+      optionalServices: [SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', () => { log('Bluetooth หลุด'); cleanup(); });
+    setBle('กำลังเชื่อมต่อ...', 'warn');
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE);
+    rxChar = await service.getCharacteristic(RX_CHAR);
+    setBle('เชื่อมต่อแล้ว: ' + (device.name || 'SOS-Beacon'), 'ok');
+    log('เชื่อมต่อ Bluetooth สำเร็จ');
+    homeBtn.disabled = false; disconnectBtn.disabled = false;
+    startGps();   // ถ้าเริ่มไปแล้วจะข้ามเอง
+    sendTimer = setInterval(sendPosition, SEND_EVERY_MS);
+    requestWakeLock();
+  } catch (e) {
+    log('เชื่อมต่อไม่สำเร็จ: ' + e.message);
+    cleanup();
+  }
+});
+
+homeBtn.addEventListener('click', async () => {
+  if (!lastPos) { log('ยังไม่มีตำแหน่งจากมือถือ รอสักครู่แล้วลองใหม่'); return; }
+  try {
+    await sendPosition();          // ส่งตำแหน่งล่าสุดก่อน เพื่อให้บอร์ดมีค่าใหม่
+    await new Promise(r => setTimeout(r, 300));
+    await write('H');
+    log(`สั่งบันทึก Home ที่ ${lastPos.lat.toFixed(5)}, ${lastPos.lon.toFixed(5)} (ถ้าสำเร็จ LED บนบอร์ดจะติด 1 วินาที)`);
+  } catch (e) {
+    log('สั่งตั้ง Home ไม่สำเร็จ: ' + e.message);
+  }
+});
+
+disconnectBtn.addEventListener('click', () => {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  cleanup();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && rxChar) requestWakeLock();
+});
+</script>
+</body>
+</html>
